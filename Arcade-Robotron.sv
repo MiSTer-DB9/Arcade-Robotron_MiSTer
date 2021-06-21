@@ -39,8 +39,9 @@ module emu
 	output        CE_PIXEL,
 
 	//Video aspect ratio for HDMI. Most retro systems have ratio 4:3.
-	output [11:0] VIDEO_ARX,
-	output [11:0] VIDEO_ARY,
+	//if VIDEO_ARX[12] or VIDEO_ARY[12] is set then [11:0] contains scaled size instead of aspect ratio.
+	output [12:0] VIDEO_ARX,
+	output [12:0] VIDEO_ARY,
 
 	output  [7:0] VGA_R,
 	output  [7:0] VGA_G,
@@ -52,13 +53,17 @@ module emu
 	output [1:0]  VGA_SL,
 	output        VGA_SCALER, // Force VGA scaler
 
-	// Use framebuffer from DDRAM (USE_FB=1 in qsf)
+	input  [11:0] HDMI_WIDTH,
+	input  [11:0] HDMI_HEIGHT,
+
+`ifdef MISTER_FB
+	// Use framebuffer in DDRAM (USE_FB=1 in qsf)
 	// FB_FORMAT:
 	//    [2:0] : 011=8bpp(palette) 100=16bpp 101=24bpp 110=32bpp
 	//    [3]   : 0=16bits 565 1=16bits 1555
 	//    [4]   : 0=RGB  1=BGR (for 16/24/32 modes)
 	//
-	// FB_STRIDE either 0 (rounded to 256 bytes) or multiple of 16 bytes.
+	// FB_STRIDE either 0 (rounded to 256 bytes) or multiple of pixel size (in bytes)
 	output        FB_EN,
 	output  [4:0] FB_FORMAT,
 	output [11:0] FB_WIDTH,
@@ -69,6 +74,7 @@ module emu
 	input         FB_LL,
 	output        FB_FORCE_BLANK,
 
+`ifdef MISTER_FB_PALETTE
 	// Palette control for 8bit modes.
 	// Ignored for other video modes.
 	output        FB_PAL_CLK,
@@ -76,6 +82,8 @@ module emu
 	output [23:0] FB_PAL_DOUT,
 	input  [23:0] FB_PAL_DIN,
 	output        FB_PAL_WR,
+`endif
+`endif
 
 	output        LED_USER,  // 1 - ON, 0 - OFF.
 
@@ -85,10 +93,26 @@ module emu
 	output  [1:0] LED_POWER,
 	output  [1:0] LED_DISK,
 
+	// I/O board button press simulation (active high)
+	// b[1]: user button
+	// b[0]: osd button
+	output  [1:0] BUTTONS,
+
 	input         CLK_AUDIO, // 24.576 MHz
 	output [15:0] AUDIO_L,
 	output [15:0] AUDIO_R,
 	output        AUDIO_S,   // 1 - signed audio samples, 0 - unsigned
+	output  [1:0] AUDIO_MIX, // 0 - no mix, 1 - 25%, 2 - 50%, 3 - 100% (mono)
+
+	//ADC
+	inout   [3:0] ADC_BUS,
+
+	//SD-SPI
+	output        SD_SCK,
+	output        SD_MOSI,
+	input         SD_MISO,
+	output        SD_CS,
+	input         SD_CD,
 
 	//High latency DDR3 RAM interface
 	//Use for non-critical time purposes
@@ -103,6 +127,40 @@ module emu
 	output  [7:0] DDRAM_BE,
 	output        DDRAM_WE,
 
+	//SDRAM interface with lower latency
+	output        SDRAM_CLK,
+	output        SDRAM_CKE,
+	output [12:0] SDRAM_A,
+	output  [1:0] SDRAM_BA,
+	inout  [15:0] SDRAM_DQ,
+	output        SDRAM_DQML,
+	output        SDRAM_DQMH,
+	output        SDRAM_nCS,
+	output        SDRAM_nCAS,
+	output        SDRAM_nRAS,
+	output        SDRAM_nWE,
+
+`ifdef MISTER_DUAL_SDRAM
+	//Secondary SDRAM
+	//Set all output SDRAM_* signals to Z ASAP if SDRAM2_EN is 0
+	input         SDRAM2_EN,
+	output        SDRAM2_CLK,
+	output [12:0] SDRAM2_A,
+	output  [1:0] SDRAM2_BA,
+	inout  [15:0] SDRAM2_DQ,
+	output        SDRAM2_nCS,
+	output        SDRAM2_nCAS,
+	output        SDRAM2_nRAS,
+	output        SDRAM2_nWE,
+`endif
+
+	input         UART_CTS,
+	output        UART_RTS,
+	input         UART_RXD,
+	output        UART_TXD,
+	output        UART_DTR,
+	input         UART_DSR,
+
 	// Open-drain User port.
 	// 0 - D+/RX
 	// 1 - D-/TX
@@ -111,13 +169,21 @@ module emu
 	output	USER_OSD,
 	output  [1:0] USER_MODE,
 	input	[7:0] USER_IN,
-	output	[7:0] USER_OUT
+	output	[7:0] USER_OUT,
+	input         OSD_STATUS
 );
 
+///////// Default values for ports not used in this core /////////
 
+assign ADC_BUS  = 'Z;
+
+assign {UART_RTS, UART_TXD, UART_DTR} = 0;
+assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
+assign {SDRAM_DQ, SDRAM_A, SDRAM_BA, SDRAM_CLK, SDRAM_CKE, SDRAM_DQML, SDRAM_DQMH, SDRAM_nWE, SDRAM_nCAS, SDRAM_nRAS, SDRAM_nCS} = 'Z;
 assign VGA_F1    = 0;
 
 assign VGA_SCALER =0;
+assign AUDIO_MIX = 0;
 wire         CLK_JOY = CLK_50M;         //Assign clock between 40-50Mhz
 wire   [2:0] JOY_FLAG  = {status[30],status[31],status[29]}; //Assign 3 bits of status (31:29) o (63:61)
 wire         JOY_CLK, JOY_LOAD, JOY_SPLIT, JOY_MDSEL;
@@ -131,12 +197,14 @@ assign       USER_OSD  = joydb_1[10] & joydb_1[6];
 assign LED_USER  = ioctl_download;
 assign LED_DISK  = 0;
 assign LED_POWER = 0;
-assign {FB_PAL_CLK, FB_FORCE_BLANK, FB_PAL_ADDR, FB_PAL_DOUT, FB_PAL_WR} = '0;
+assign BUTTONS = 0;
+
+assign FB_FORCE_BLANK = '0;
 
 wire [1:0] ar = status[17:16];
 
-assign VIDEO_ARX = (!ar) ?  8'd4  : (ar - 1'd1);
-assign VIDEO_ARY = (!ar) ?  8'd3  : 12'd0;
+assign VIDEO_ARX = (!ar) ? ((status[2] | landscape) ? 8'd4 : 8'd3) : (ar - 1'd1);
+assign VIDEO_ARY = (!ar) ? ((status[2] | landscape) ? 8'd3 : 8'd4) : 12'd0;
 
 
 `include "build_id.v" 
@@ -151,13 +219,17 @@ localparam CONF_STR = {
 	"OT,UserIO Players, 1 Player,2 Players;",
 	"-;",
 	"h2O6,Fire,4-way,Move+Fire;",
-	"h2-;",
 	"h3O67,Control,Mode 1,Mode 2,Cabinet;",
-	"h3-;",
+	"h4O67,Fire,4-way,Move with Fire,Second Joystick;",
+	"h2h3h4-;",
 	"DIP;",
 	"-;",
+	"P1,Pause options;",
+	"P1OP,Pause when OSD is open,On,Off;",
+	"P1OQ,Dim video after 10s,On,Off;",
+	"-;",
 	"R0,Reset;",
-	"J1,Fire 1,Fire 2,Fire 3,Fire 4,Start 1P,Start 2P,Coin;",
+	"J1,Fire 1,Fire 2,Fire 3,Fire 4,Start 1P,Start 2P,Coin,Pause;",
 	"V,v",`BUILD_DATE
 };
 
@@ -243,7 +315,7 @@ hps_io #(.STRLEN($size(CONF_STR)>>3)) hps_io
 
 	.buttons(buttons),
 	.status(status),
-	.status_menumask({mod == mod_stargate,fourfire,landscape,direct_video}),
+	.status_menumask({mod == mod_robotron,mod == mod_stargate,mod == mod_splat,landscape,direct_video}),
 	.forced_scandoubler(forced_scandoubler),
 	.gamma_bus(gamma_bus),
 	.direct_video(direct_video),
@@ -276,6 +348,7 @@ wire m_start2  = joy[11];
 wire m_coin1   = joy[12];
 wire m_advance = joy[13];
 wire m_autoup  = joy[14];
+wire m_pause   = joy[15];
 
 wire m_right1  = joy1[0];
 wire m_left1   = joy1[1];
@@ -287,10 +360,6 @@ wire m_fire1c  = joy1[6];
 wire m_fire1d  = joy1[7];
 wire m_fire1e  = joy1[8];
 wire m_fire1f  = joy1[9];
-//wire m_rcw1    =              joy1[8];
-//wire m_rccw1   =              joy1[9];
-//wire m_spccw1  =              joy1[30];
-//wire m_spcw1   =              joy1[31];
 
 wire m_right2  = joy2[0];
 wire m_left2   = joy2[1];
@@ -302,10 +371,6 @@ wire m_fire2c  = joy2[6];
 wire m_fire2d  = joy2[7];
 wire m_fire2e  = joy2[8];
 wire m_fire2f  = joy2[9];
-//wire m_rcw2    =              joy2[8];
-//wire m_rccw2   =              joy2[9];
-//wire m_spccw2  =              joy2[30];
-//wire m_spcw2   =              joy2[31];
 
 wire m_right   = m_right1 | m_right2;
 wire m_left    = m_left1  | m_left2; 
@@ -317,10 +382,16 @@ wire m_fire_c  = m_fire1c | m_fire2c;
 wire m_fire_d  = m_fire1d | m_fire2d;
 wire m_fire_e  = m_fire1e | m_fire2e;
 wire m_fire_f  = m_fire1f | m_fire2f;
-//wire m_rcw     = m_rcw1   | m_rcw2;
-//wire m_rccw    = m_rccw1  | m_rccw2;
-//wire m_spccw   = m_spccw1 | m_spccw2;
-//wire m_spcw    = m_spcw1  | m_spcw2;
+
+// PAUSE SYSTEM
+wire				pause_cpu;
+wire [7:0]		rgb_out;
+pause #(3,3,2,12) pause (
+	.*,
+	.user_button(m_pause),
+	.pause_request(1'b0),
+	.options(~status[26:25])
+);
 
 ///////////////////////////////////////////////////////////////////
 
@@ -348,8 +419,7 @@ reg  [7:0] SW;
 reg  [2:0] BTN;
 reg        blitter_sc2, sinistar;
 reg        landscape;
-reg        fourfire;
-reg        speech_en;
+
 
 always @(*) begin
 
@@ -359,18 +429,15 @@ always @(*) begin
 	BTN = 0;
 	blitter_sc2 = 0;
 	sinistar = 0;
-	fourfire = 0;
-	speech_en = 0;
 	SW  = sw[0] | { 6'b0,m_advance,m_autoup};
 
 	case (mod)
 		mod_robotron:
 			begin
-				fourfire = 1;
 				BTN = { m_start1, m_start2, m_coin1 };
-				JA  = ~{ status[6] ? {m_right, m_left, m_down, m_up} : {m_fire_a, m_fire_d, m_fire_b, m_fire_c}, m_right, m_left, m_down, m_up };
+				JA  = ~{ status[7] ? {m_right2, m_left2, m_down2, m_up2} : status[6] ? {m_right, m_left, m_down, m_up} : {m_fire_a, m_fire_d, m_fire_b, m_fire_c},
+							status[7] ? {m_right1, m_left1, m_down1, m_up1} : {m_right, m_left, m_down, m_up}};
 				JB  = JA;
-
 			end
 		mod_joust:
 			begin
@@ -380,7 +447,6 @@ always @(*) begin
 			end
 		mod_splat:
 			begin
-				fourfire = 1;
 				blitter_sc2 = 1;
 				BTN = { m_start1, m_start2, m_coin1 };
 				JA  = ~{ status[6] ? {m_right1, m_left1, m_down1, m_up1} : {m_fire1a, m_fire1d, m_fire1b, m_fire1c}, m_right1, m_left1, m_down1, m_up1 };
@@ -407,7 +473,6 @@ always @(*) begin
 		mod_sinistar:
 			begin
 				sinistar = 1;
-				speech_en = 1;
 				landscape = 0;
 				BTN = { m_start1, m_start2, m_coin1 };
 				JA  = ~{ (amx == 7) ? dmx : amx, (amy == 7) ? dmy : amy };
@@ -416,7 +481,6 @@ always @(*) begin
 		mod_playball:
 			begin
 				landscape = 0;
-				speech_en = 1;
 				BTN = { 2'b00, m_coin1 };
 				JA  = ~{ 4'b0000, m_start2, m_right, m_left, m_start1 };
 				JB  = JA;
@@ -500,6 +564,8 @@ williams_soc soc
 	.RamLB       ( ramlb       ),
 	.RamUB       ( ramub       ),
 
+	.pause       ( pause_cpu   ),
+
 	.dl_clock    ( clk_sys     ),
 	.dl_addr     ( ioctl_addr[16:0] ),
 	.dl_data     ( ioctl_dout  ),
@@ -565,8 +631,8 @@ always @(posedge clk_sys) begin
 	if (pcnt[10:1] == 336) HBlank <= 1;
 	if (pcnt[10:1] == 040) HBlank <= 0;
 
-	if (lcnt == 246) VBlank <= 1;
-	if (lcnt == 006) VBlank <= 0;
+	if (lcnt == 256) VBlank <= 1;
+	if (lcnt == 013) VBlank <= 0;
 end
 
 wire rotate_ccw = 1;
@@ -576,7 +642,7 @@ arcade_video #(296,8) arcade_video
 (
 	.*,
 	.clk_video(clk_vid),
-	.RGB_in({r,g,b}),
+	.RGB_in(rgb_out),
 	.HSync(hs),
 	.VSync(vs),
 	.fx(status[5:3])
@@ -584,9 +650,9 @@ arcade_video #(296,8) arcade_video
 
 ///////////////////////////////////////////////////////////////////
 
-wire [16:0] audsum = {1'b0, audio, audio} + {1'b0, speech};
-
-assign AUDIO_L = speech_en ? audsum[16:1] : {audio, audio};
+logic [16:0] audsum;
+assign audsum = {audio, 8'd0} + speech;
+assign AUDIO_L = {1'b0, audsum[16:3]};
 assign AUDIO_R = AUDIO_L;
 assign AUDIO_S = 0;
 
